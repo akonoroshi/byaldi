@@ -7,9 +7,10 @@ from typing import Dict, List, Optional, Union, cast
 
 import srsly
 import torch
-from colpali_engine.models import ColPali, ColPaliProcessor, ColQwen2, ColQwen2Processor
+from colpali_engine.models import ColPali, ColPaliProcessor, ColQwen2, ColQwen2Processor, ColQwen2_5, ColQwen2_5_Processor
 from pdf2image import convert_from_path
 from PIL import Image
+from transformers.utils.import_utils import is_flash_attn_2_available
 
 from byaldi.objects import Result
 
@@ -77,16 +78,20 @@ class ColPaliModel:
                 ),
                 token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
             )
+        elif "colqwen2.5" in pretrained_model_name_or_path.lower():
+            self.model = ColQwen2_5.from_pretrained(
+                self.pretrained_model_name_or_path,
+                torch_dtype=torch.bfloat16,
+                device_map=device,
+                attn_implementation="flash_attention_2" if is_flash_attn_2_available() else None,
+                token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
+            )
         elif "colqwen2" in pretrained_model_name_or_path.lower():
             self.model = ColQwen2.from_pretrained(
                 self.pretrained_model_name_or_path,
                 torch_dtype=torch.bfloat16,
-                device_map=(
-                    "cuda"
-                    if device == "cuda"
-                    or (isinstance(device, torch.device) and device.type == "cuda")
-                    else None
-                ),
+                device_map=device,
+                attn_implementation="flash_attention_2" if is_flash_attn_2_available() else None,
                 token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
             )
         self.model = self.model.eval()
@@ -95,6 +100,14 @@ class ColPaliModel:
             self.processor = cast(
                 ColPaliProcessor,
                 ColPaliProcessor.from_pretrained(
+                    self.pretrained_model_name_or_path,
+                    token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
+                ),
+            )
+        elif "colqwen2.5" in pretrained_model_name_or_path.lower():
+            self.processor = cast(
+                ColQwen2_5_Processor,
+                ColQwen2_5_Processor.from_pretrained(
                     self.pretrained_model_name_or_path,
                     token=kwargs.get("hf_token", None) or os.environ.get("HF_TOKEN"),
                 ),
@@ -607,10 +620,11 @@ class ColPaliModel:
     
     def search(
         self,
-        query: Union[str, List[str]],
+        query: Union[str, List[str], Image.Image, List[Image.Image]],
         k: int = 10,
         filter_metadata: Optional[Dict[str,str]] = None,
         return_base64_results: Optional[bool] = None,
+        image_query: Optional[Union[Image.Image, List[Image.Image], List[List[Image.Image]]]] = None,
     ) -> Union[List[Result], List[List[Result]]]:
         # Set default value for return_base64_results if not provided
         if return_base64_results is None:
@@ -621,18 +635,36 @@ class ColPaliModel:
         k = min(k, len(self.indexed_embeddings))
 
         # Process query/queries
-        if isinstance(query, str):
+        if isinstance(query, (str, Image.Image)):
             queries = [query]
         else:
             queries = query
+        if image_query is None:
+            image_queries = [[]*len(queries)]
+        elif isinstance(image_query, Image.Image):
+            image_queries = [[i] for i in image_query]
+        elif isinstance(image_query[0], Image.Image):
+            image_queries = [image_query]
+        else:
+            image_queries = image_query
+
+        assert len(queries) == len(image_queries), "Number of queries must match number of image queries."
 
         results = []
-        for q in queries:
+        for q, img in zip(queries, image_queries):
             # Process query
             with torch.inference_mode():
-                batch_query = self.processor.process_queries([q])
+                if isinstance(q, str):
+                    batch_query = self.processor.process_queries([q])
+                else:
+                    batch_query = self.processor.process_images([q])
                 batch_query = {k: v.to(self.device).to(self.model.dtype if v.dtype in [torch.float16, torch.bfloat16, torch.float32] else v.dtype) for k, v in batch_query.items()}
                 embeddings_query = self.model(**batch_query)
+                
+                if len(img) > 0:
+                    batch_image_query = self.processor.process_images(img)
+                    batch_image_query = {k: v.to(self.device).to(self.model.dtype if v.dtype in [torch.float16, torch.bfloat16, torch.float32] else v.dtype) for k, v in batch_image_query.items()}
+                    embeddings_image_query = self.model(**batch_image_query)
             qs = list(torch.unbind(embeddings_query.to("cpu")))
             if not filter_metadata:
                 req_embeddings = self.indexed_embeddings
@@ -665,7 +697,7 @@ class ColPaliModel:
 
             results.append(query_results)
 
-        return results[0] if isinstance(query, str) else results
+        return results[0] if isinstance(query, (str, Image.Image)) else results
 
     def encode_image(
         self, input_data: Union[str, Image.Image, List[Union[str, Image.Image]]]
